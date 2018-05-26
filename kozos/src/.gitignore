@@ -1,0 +1,6 @@
+
+*.elf
+*.mot
+*.o
+kzload
+kzos
