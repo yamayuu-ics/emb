@@ -39,6 +39,34 @@ typedef struct _kz_thread
     kz_context context; /* コンテキスト情報 */
 } kz_thread;
 
+/* メッセージ・バッファ */
+typedef struct _kz_msgbuf {
+  struct _kz_msgbuf *next;
+  kz_thread *sender; /* メッセージを送信したスレッド */
+  struct { /* メッセージのパラメータ保存領域 */
+    int size;
+    char *p;
+  } param;
+} kz_msgbuf;
+
+/* メッセージ・ボックス */
+typedef struct _kz_msgbox {
+  kz_thread *receiver; /* 受信待ち状態のスレッド */
+  kz_msgbuf *head;
+  kz_msgbuf *tail;
+
+  /*
+   * H8は16ビットCPUなので，32ビット整数に対しての乗算命令が無い．よって
+   * 構造体のサイズが２の累乗になっていないと，構造体の配列のインデックス
+   * 計算で乗算が使われて「___mulsi3が無い」などのリンク・エラーになる場合が
+   * ある．(２の累乗ならばシフト演算が利用されるので問題は出ない)
+   * 対策として，サイズが２の累乗になるようにダミー・メンバで調整する．
+   * 他構造体で同様のエラーが出た場合には，同様の対処をすること．
+   */
+  long dummy[1];
+} kz_msgbox;
+
+
 /* スレッドのレディー・キュー */
 static struct
 {
@@ -49,6 +77,7 @@ static struct
 static kz_thread *current; /* カレント・スレッド */
 static kz_thread threads[THREAD_NUM]; /* タスク・コントロール・ブロック */
 static kz_handler_t handlers[SOFTVEC_TYPE_NUM]; /* 割込みハンドラ */
+static kz_msgbox msgboxes[MSGBOX_ID_NUM]; /* メッセージ・ボックス */
 
 void dispatch(kz_context *context);
 
@@ -215,6 +244,99 @@ static int thread_kmfree(char *p)
   return 0;
 }
 
+/* メッセージの送信処理 */
+static void sendmsg(kz_msgbox *mboxp, kz_thread *thp, int size, char *p)
+{
+  kz_msgbuf *mp;
+
+  /* メッセージ・バッファの作成 */
+  mp = (kz_msgbuf *)kzmem_alloc(sizeof(*mp));
+  if (mp == NULL)
+    kz_sysdown();
+  mp->next       = NULL;
+  mp->sender     = thp;
+  mp->param.size = size;
+  mp->param.p    = p;
+
+  /* メッセージ・ボックスの末尾にメッセージを接続する */
+  if (mboxp->tail) {
+    mboxp->tail->next = mp;
+  } else {
+    mboxp->head = mp;
+  }
+  mboxp->tail = mp;
+}
+
+/* メッセージの受信処理 */
+static void recvmsg(kz_msgbox *mboxp)
+{
+  kz_msgbuf *mp;
+  kz_syscall_param_t *p;
+
+  /* メッセージ・ボックスの先頭にあるメッセージを抜き出す */
+  mp = mboxp->head;
+  mboxp->head = mp->next;
+  if (mboxp->head == NULL)
+    mboxp->tail = NULL;
+  mp->next = NULL;
+
+  /* メッセージを受信するスレッドに返す値を設定する */
+  p = mboxp->receiver->syscall.param;
+  p->un.recv.ret = (kz_thread_id_t)mp->sender;
+  if (p->un.recv.sizep)
+    *(p->un.recv.sizep) = mp->param.size;
+  if (p->un.recv.pp)
+    *(p->un.recv.pp) = mp->param.p;
+
+  /* 受信待ちスレッドはいなくなったので，NULLに戻す */
+  mboxp->receiver = NULL;
+
+  /* メッセージ・バッファの解放 */
+  kzmem_free(mp);
+}
+
+/* システム・コールの処理(kz_send():メッセージ送信) */
+static int thread_send(kz_msgbox_id_t id, int size, char *p)
+{
+  kz_msgbox *mboxp = &msgboxes[id];
+
+  putcurrent();
+  sendmsg(mboxp, current, size, p); /* メッセージの送信処理 */
+
+  /* 受信待ちスレッドが存在している場合には受信処理を行う */
+  if (mboxp->receiver) {
+    current = mboxp->receiver; /* 受信待ちスレッド */
+    recvmsg(mboxp); /* メッセージの受信処理 */
+    putcurrent(); /* 受信により動作可能になったので，ブロック解除する */
+  }
+
+  return size;
+}
+
+/* システム・コールの処理(kz_recv():メッセージ受信) */
+static kz_thread_id_t thread_recv(kz_msgbox_id_t id, int *sizep, char **pp)
+{
+  kz_msgbox *mboxp = &msgboxes[id];
+
+  if (mboxp->receiver) /* 他のスレッドがすでに受信待ちしている */
+    kz_sysdown();
+
+  mboxp->receiver = current; /* 受信待ちスレッドに設定 */
+
+  if (mboxp->head == NULL) {
+    /*
+     * メッセージ・ボックスにメッセージが無いので，スレッドを
+     * スリープさせる．(システム・コールがブロックする)
+     */
+    return -1;
+  }
+
+  recvmsg(mboxp); /* メッセージの受信処理 */
+  putcurrent(); /* メッセージを受信できたので，レディー状態にする */
+
+  return current->syscall.param->un.recv.ret;
+}
+
 static int setintr(softvec_type_t type,kz_handler_t handler){
     static void thread_intr(softvec_type_t type,unsigned long sp);
 
@@ -251,6 +373,14 @@ static void call_functions(kz_syscall_type_t type,kz_syscall_param_t *p){
             break;
         case KZ_SYSCALL_TYPE_KMFREE: /* kz_kmfree() */
             p->un.kmfree.ret = thread_kmfree(p->un.kmfree.p);
+            break;
+        case KZ_SYSCALL_TYPE_SEND: /* kz_send() */
+            p->un.send.ret = thread_send(p->un.send.id,
+                                         p->un.send.size, p->un.send.p);
+            break;
+        case KZ_SYSCALL_TYPE_RECV: /* kz_recv() */
+            p->un.recv.ret = thread_recv(p->un.recv.id,
+                                         p->un.recv.sizep, p->un.recv.pp);
             break;
         default:
             break;
@@ -305,6 +435,7 @@ void kz_start(kz_func_t func ,char *name,int priority,int stacksize,int argc,cha
     memset(readyque,0,sizeof(readyque));
     memset(threads,0,sizeof(threads));
     memset(handlers,0,sizeof(handlers));
+    memset(msgboxes, 0, sizeof(msgboxes));
 
     setintr(SOFTVEC_TYPE_SYSCALL,syscall_intr);
     setintr(SOFTVEC_TYPE_SOFTERR,softerr_intr);
